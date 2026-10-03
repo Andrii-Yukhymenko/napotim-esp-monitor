@@ -11,6 +11,47 @@ validates TLS using ISRG Root X1 and NTP time, and only redraws changed rows.
 The footer records successful receipt, validation and rendering. Network errors
 retain the last snapshot with a stale indicator; an invalid/revoked key clears it.
 
+Version 1.1.3 starts Wi-Fi/NTP before display initialization and filesystem loading,
+so connection establishment overlaps the display reset delays and initial drawing.
+It also removes repeated full-screen startup redraws and avoids clearing rows,
+the header and footer again after a full-screen clear. Only changed startup text
+is repainted. A terminal negative BearSSL read now rejects a truncated response
+immediately instead of waiting out the remaining 15-second deadline. Positive
+reads continue draining buffered TLS records even after TCP closes; a live slow
+connection still gets the existing deadline. Host regression checks cover these
+cases, Wi-Fi loss, allocation failures and timer rollover in
+`bash scripts/test-snapshot-reader.sh`.
+
+Authenticated `/status` includes a `timing` object: observed Wi-Fi/clock readiness,
+the first request and successful rendering times measured from boot, and the most
+recent HTTP, body read, cleanup, validation/rendering and complete poll durations,
+all in milliseconds. These distinguish network waiting from firmware work without
+storing task text or credentials. HTTPS certificate validation remains enabled.
+On-device verification after authenticated OTA confirmed version 1.1.3 and five
+rendered tasks on the first request: Wi-Fi observed ready at 10.232 s, clock at
+11.561 s, GET started at 11.935 s and rendering finished at 22.539 s. HTTP took
+6741 ms, body reading 74 ms, cleanup 2 ms and validation/rendering 3787 ms.
+The complete HTTP 200 response contained 1782 bytes, with no TLS/body error,
+RSSI -74 dBm and about 38 KB free heap. Brightness 50, rotation 2 and pairing
+were preserved; successful receipt restored the normal 60-second polling interval.
+
+Version 1.1.1 removes the startup polling delay: the first HTTPS request starts
+as soon as both Wi-Fi and NTP time are ready. Until the first valid snapshot,
+failed requests retry 3 seconds after completion instead of waiting 1–5 minutes.
+Successful receipt restores the normal 60-second interval and later failures
+retain the existing backoff. Reconnecting Wi-Fi triggers an immediate request.
+The initial screen distinguishes Wi-Fi connection, clock synchronization, task
+retrieval and waiting to retry; Wi-Fi readiness changes clear obsolete errors.
+TLS validation and the existing 15-second network/body timeouts remain enabled.
+`/status` also reports clock readiness, Wi-Fi RSSI and the current poll interval.
+Run `bash scripts/test-poll-schedule.sh` to verify startup readiness, retry timing,
+reconnection, normal polling and `millis()` rollover. Version 1.1.1 was installed
+through authenticated OTA and verified on the physical cube: its first poll
+received and rendered five tasks from a complete 1771-byte HTTP 200 response.
+The first successful snapshot arrived approximately 26 seconds after the reboot
+with RSSI -77 dBm. Brightness 50, rotation 2 and the saved pairing survived;
+the poll interval returned to 60 seconds and free heap was about 39 KB.
+
 ## Build
 
 ```bash
@@ -22,7 +63,7 @@ python3 -m venv .venv
 Output: `.pio/build/ultra/firmware.bin`. The main firmware has no compiled Wi-Fi
 password, account password or device token. It uses saved ESP SDK Wi-Fi settings.
 Runtime config lives in LittleFS and survives ordinary OTA updates. Version
-1.0.9 is installed on the connected cube, with rotation 2 saved and standard
+1.1.3 is installed on the connected cube, with rotation 2 saved and standard
 HTTP Digest login verified on the actual hardware. The device has completed a
 certificate-validated HTTPS request with the real account key and rendered its
 account snapshot.
@@ -42,8 +83,18 @@ from a complete 1505-byte HTTPS snapshot, with saved settings intact and over
 
 Version 1.0.9 uses the same shared red (RGB565 0xF924) for overdue titles,
 high-priority bars and overdue deadline text, at the owner's request.
-Red and white titles share exactly the same native glyph masks, baseline, size
-and renderer. Only their color differs.
+In that version, red and white titles share exactly the same native glyph masks,
+baseline, size and renderer; only their color differs.
+
+Version 1.0.10 compensates for the thinner appearance of red titles observed on
+the LCD. It adds a faint right edge (40% red over the background, RGB565 0x68A2)
+inside each existing 7-pixel glyph cell. Original title pixels remain 0xF924;
+white titles are pixel-for-pixel unchanged. Glyph height, baseline, character
+advance, clipping, metadata and priority markers retain their previous values.
+This is a first optical adjustment; its perceived weight needs review on the LCD.
+The firmware build and a host comparison of all 357 glyphs passed. After OTA,
+the cube reported version 1.0.10 and rendered all five tasks from a complete
+1505-byte HTTPS response, with brightness 100 and rotation 2 preserved.
 
 Version 1.0.5 also drains the complete bounded HTTPS body before parsing it.
 During hardware checks, `HTTPClient::getString()` returned only 458 of 1505 bytes
@@ -55,6 +106,44 @@ snapshots without another restart, with over 38 KB free heap. An intervening
 connection failure retained the previous snapshot and recovered automatically.
 
 ## Configure
+
+Firmware 1.1.0 supports per-device brightness and rotation from Напотім →
+Налаштування → Пристрої. Manual mode uses brightness 1–100%; scheduled mode
+uses day/night levels and local start times with a fixed 15-minute transition.
+The two starts must be at least 15 minutes apart, including across midnight.
+Rotation values 0–3 correspond to 0°, 90°, 180° and 270°.
+
+Settings arrive in the existing minute-by-minute task snapshot and are saved
+only when configuration changes. On the first capable poll, the cube supplies
+its existing brightness and rotation so an unconfigured server preserves them.
+An explicit save in the app takes precedence over this initialization.
+Old firmware ignores the additional fields; new firmware also accepts the old API.
+
+The cube computes scheduled brightness every second without needing a live
+server connection. It caches the account's UTC offset and up to four future
+offset transitions covering approximately a year, so temporary outages do not
+prevent seasonal clock changes. After a power loss, it uses manual brightness
+until NTP restores the clock and a saved timezone is available. ESP8266 has no
+battery-backed clock; a restart without internet cannot establish the time.
+Changing a schedule or rotation can apply immediately; subsequent daily
+transitions interpolate at PWM resolution without flash writes.
+
+The local configuration page remains available for pairing and recovery.
+Cloud-managed values replace local brightness/rotation changes on the next
+successful poll. `/status` reports the saved display settings, effective
+brightness and whether settings have been received from the server.
+
+Run `bash scripts/test-display-settings.sh` for host checks covering fades,
+midnight, reversed day/night periods, clock fallback and cached timezone changes.
+Build with `.venv/bin/pio run -e ultra`. Firmware 1.1.0 is installed on the
+physical cube through authenticated OTA. It booted with brightness 100 and
+rotation 2 preserved and received/rendered all five current tasks.
+The companion application change was merged in
+[pull request #33](https://github.com/Andrii-Yukhymenko/napotim/pull/33)
+and deployed successfully. On the physical cube, `/status` confirmed
+`settings_remote: true`, manual brightness 100, rotation 2, five tasks,
+and a complete validated 1770-byte HTTPS response with about 39 KB free heap.
+The current mode remains manual; choose scheduled mode in the application.
 
 The first boot displays the device IP and a unique configuration password.
 Open that address, sign in as `admin`, and paste a key created in
