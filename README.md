@@ -8,8 +8,23 @@ Tasks for a whole day sort at the end of that day. Hidden tasks are counted.
 
 The firmware polls `https://napotim.duckdns.org/api/device/v1/today` once a minute,
 validates TLS using ISRG Root X1 and NTP time, and only redraws changed rows.
-The footer records successful receipt, validation and rendering. Network errors
+The header records successful receipt, validation and rendering. Network errors
 retain the last snapshot with a stale indicator; an invalid/revoked key clears it.
+
+Version 1.1.4 centers the snapshot date in the top line and right-aligns
+`Оновлено HH:MM`. The label remains muted gray; only the time turns the same
+red as overdue tasks and high-priority markers when connectivity or a refresh
+fails. It remains red during recovery until a complete snapshot is successfully
+validated and rendered. The footer is reserved for `Ще N задач` after the first
+snapshot and never replaces that count with a connection error or relative age.
+Startup readiness messages remain available before any snapshot is received.
+`/status` reports `hidden_count` and `update_stale` for diagnostics. The 240-pixel
+header layout and gray/red states were checked with the actual bitmap glyphs;
+the six task rows and their title renderer retain their previous layout.
+Authenticated OTA and `/health` confirmed 1.1.4 on the physical cube. Its first
+request received a complete 2034-byte HTTP 200 snapshot, rendered all six visible
+tasks and reported one hidden task with `update_stale: false`, no data error,
+brightness 50 and rotation 2 preserved.
 
 Version 1.1.3 starts Wi-Fi/NTP before display initialization and filesystem loading,
 so connection establishment overlaps the display reset delays and initial drawing.
@@ -63,7 +78,7 @@ python3 -m venv .venv
 Output: `.pio/build/ultra/firmware.bin`. The main firmware has no compiled Wi-Fi
 password, account password or device token. It uses saved ESP SDK Wi-Fi settings.
 Runtime config lives in LittleFS and survives ordinary OTA updates. Version
-1.1.3 is installed on the connected cube, with rotation 2 saved and standard
+1.1.4 is installed on the connected cube, with rotation 2 saved and standard
 HTTP Digest login verified on the actual hardware. The device has completed a
 certificate-validated HTTPS request with the real account key and rendered its
 account snapshot.

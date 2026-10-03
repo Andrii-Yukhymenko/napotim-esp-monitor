@@ -45,6 +45,7 @@ bool configured = false, apActive = false, showSetup = true;
 PollSchedule pollSchedule;
 uint32_t setupStarted = 0, lastFooterMinute = UINT32_MAX;
 time_t lastSuccess = 0;
+bool refreshFailed = false;
 int utcOffset = 0;
 String date, failure, setupAddress;
 int lastHttpStatus = 0, lastTlsError = 0;
@@ -304,38 +305,51 @@ String dayLabel(const Task& task) {
   return task.dueDate.substring(8, 10) + "." + task.dueDate.substring(5, 7);
 }
 
-void drawFooter(bool force = false, bool clear = true) {
-  String top, bottom;
-  uint16_t bottomColor = MUTED;
-  int baseline = lastSuccess ? 225 : 227;
-  if (!lastSuccess) {
-    top = WiFi.status() != WL_CONNECTED ? "Очікування Wi-Fi" :
-      time(nullptr) < 1760000000 ? "Очікування часу" :
-      failure.length() ? failure : "Очікування даних…";
-  } else {
+bool updateStale() {
+  return lastSuccess && (refreshFailed || WiFi.status() != WL_CONNECTED || time(nullptr) < 1760000000);
+}
+
+void drawUpdateStatus(bool force = false, bool clear = true) {
+  String stamp;
+  if (lastSuccess) {
     time_t local = lastSuccess + localOffset(lastSuccess);
     struct tm clock; gmtime_r(&local, &clock);
-    char stamp[24];
-    time_t now = time(nullptr);
-    bool oldDay = (now + localOffset(now)) / 86400 != local / 86400;
-    strftime(stamp, sizeof(stamp), oldDay ? "%d.%m %H:%M" : "%H:%M", &clock);
-    top = String("Оновлено ") + stamp;
-    if (failure.length()) {
-      int age = now > lastSuccess ? (now - lastSuccess) / 60 : 0;
-      bottom = failure + " · " + age + " хв тому"; bottomColor = RED;
-    } else if (hiddenCount) bottom = String("Ще ") + hiddenCount + " задач";
+    char formatted[6]; strftime(formatted, sizeof(formatted), "%H:%M", &clock);
+    stamp = formatted;
   }
-  static String paintedTop, paintedBottom;
-  static int paintedBaseline = -1;
-  static uint16_t paintedBottomColor = MUTED;
+  uint16_t color = updateStale() ? RED : MUTED;
+  static String paintedStamp;
+  static uint16_t paintedColor = MUTED;
+  if (!force && stamp == paintedStamp && color == paintedColor) return;
   font.setFont(u8g2_font_6x12_t_cyrillic);
-  if (force || top != paintedTop || baseline != paintedBaseline ||
-      bottom != paintedBottom || bottomColor != paintedBottomColor) {
+  const String label = "Оновлено ";
+  int timeWidth = font.getUTF8Width("00:00");
+  int labelWidth = font.getUTF8Width(label.c_str());
+  int x = 235 - timeWidth - labelWidth;
+  if (clear) tft.fillRect(x, 0, 240 - x, 19, BG);
+  if (stamp.length()) {
+    textAt(x, 15, label, MUTED, labelWidth);
+    textAt(x + labelWidth, 15, stamp, color, timeWidth);
+  }
+  paintedStamp = stamp; paintedColor = color;
+}
+
+void drawFooter(bool force = false, bool clear = true) {
+  drawUpdateStatus();
+  String message;
+  int baseline = lastSuccess ? 225 : 227;
+  if (!lastSuccess) {
+    message = WiFi.status() != WL_CONNECTED ? "Очікування Wi-Fi" :
+      time(nullptr) < 1760000000 ? "Очікування часу" :
+      failure.length() ? failure : "Очікування даних…";
+  } else if (hiddenCount) message = String("Ще ") + hiddenCount + " задач";
+  static String paintedMessage;
+  static int paintedBaseline = -1;
+  font.setFont(u8g2_font_6x12_t_cyrillic);
+  if (force || message != paintedMessage || baseline != paintedBaseline) {
     if (clear) tft.fillRect(0, 213, 240, 27, BG);
-    textAt(5, baseline, top, MUTED);
-    textAt(5, 238, bottom, bottomColor);
-    paintedTop = top; paintedBaseline = baseline;
-    paintedBottom = bottom; paintedBottomColor = bottomColor;
+    textAt(5, baseline, message, MUTED);
+    paintedMessage = message; paintedBaseline = baseline;
   }
 }
 
@@ -361,8 +375,13 @@ void drawHeader(bool clear = true) {
   if (clear) tft.fillRect(0, 0, 240, 40, BG);
   font.setFont(u8g2_font_6x13_t_cyrillic);
   textAt(5, 15, "НАПОТІМ", PURPLE);
-  if (date.length() == 10) textAt(169, 15, date.substring(8) + "." + date.substring(5, 7), MUTED, 66);
   font.setFont(u8g2_font_6x12_t_cyrillic);
+  if (date.length() == 10) {
+    String label = date.substring(8) + "." + date.substring(5, 7);
+    int width = font.getUTF8Width(label.c_str());
+    textAt((240 - width) / 2, 15, label, MUTED, width);
+  }
+  drawUpdateStatus(true, false);
   textAt(5, 32, String("Сьогодні: ") + todayTotal + "   Прострочено: " + overdueTotal, MUTED);
   tft.drawFastHLine(5, 38, 230, 0x2945);
 }
@@ -486,7 +505,8 @@ bool applySnapshot(const String& payload) {
     textAt(15, 90, "На сьогодні все виконано", WHITE);
   }
   // Advance the success stamp only after validation and rendering.
-  lastSuccess = time(nullptr); failure = ""; drawFooter(first, !screenCleared);
+  lastSuccess = time(nullptr); failure = ""; refreshFailed = false;
+  drawFooter(first, !screenCleared);
   if (firstSuccessMs == UINT32_MAX) firstSuccessMs = millis();
   return true;
 }
@@ -495,8 +515,8 @@ void poll() {
   dataError = ""; responseExpected = 0; responseBytes = 0;
   lastHttpMs = lastBodyMs = lastCleanupMs = lastRenderMs = 0;
   ++pollCount; markStage(1);
-  if (WiFi.status() != WL_CONNECTED) { failure = "Немає Wi-Fi"; drawFooter(); markStage(0); return; }
-  if (time(nullptr) < 1760000000) { failure = "Очікування часу"; drawFooter(); markStage(0); return; }
+  if (WiFi.status() != WL_CONNECTED) { failure = "Немає Wi-Fi"; refreshFailed = true; drawFooter(); markStage(0); return; }
+  if (time(nullptr) < 1760000000) { failure = "Очікування часу"; refreshFailed = true; drawFooter(); markStage(0); return; }
   failure = "";
   if (showSetup) drawSetup(); else drawFooter();
   int status;
@@ -517,7 +537,7 @@ void poll() {
     String requestUrl = API_URL;
     if (!settingsRemote) requestUrl += "?initial_brightness=" + String(brightness) + "&initial_rotation=" + String(rotation);
     if (!http.begin(client, requestUrl)) {
-      failure = "Помилка HTTPS"; pollSchedule.retry(lastSuccess != 0);
+      failure = "Помилка HTTPS"; refreshFailed = true; pollSchedule.retry(lastSuccess != 0);
       if (showSetup) drawSetup(); else drawFooter();
       markStage(0); return;
     }
@@ -553,6 +573,7 @@ void poll() {
   if (applied) {
     pollSchedule.interval = PollSchedule::NORMAL_INTERVAL; markStage(0); return;
   }
+  refreshFailed = true;
   if (status == 401 || status == 403) {
     token = ""; configured = false; taskCount = 0; lastSuccess = 0; settingsRemote = false;
     for (auto& task : tasks) task = Task();
@@ -578,7 +599,7 @@ const char SETTINGS_PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="uk"><meta
 void configureWeb() {
   static bool uploadAllowed = false;
   static bool uploadStarted = false;
-  web.on("/health", HTTP_GET, []() { web.send(200, "application/json", "{\"firmware\":\"napotim-cube\",\"version\":\"1.1.3\"}"); });
+  web.on("/health", HTTP_GET, []() { web.send(200, "application/json", "{\"firmware\":\"napotim-cube\",\"version\":\"1.1.4\"}"); });
   web.on("/status", HTTP_GET, []() {
     if (!authenticated()) return;
     DynamicJsonDocument doc(2048);
@@ -587,6 +608,7 @@ void configureWeb() {
     doc["http_status"]=lastHttpStatus; doc["tls_error"]=lastTlsError;
     doc["response_expected"]=responseExpected; doc["response_bytes"]=responseBytes; doc["data_error"]=dataError;
     doc["last_success"]=lastSuccess; doc["task_count"]=taskCount;
+    doc["hidden_count"]=hiddenCount; doc["update_stale"]=updateStale();
     doc["brightness"]=brightness; doc["rotation"]=rotation;
     doc["effective_brightness"]=effectiveBrightness / 100.0;
     doc["settings_remote"]=settingsRemote; doc["timezone_known"]=timezoneKnown;
@@ -711,7 +733,9 @@ void loop() {
   bool readinessChanged = connected != previousConnected || clockReady != previousClockReady;
   if (readinessChanged) {
     if (failure == "Немає Wi-Fi" || failure == "Очікування часу") failure = "";
-    if (!connected && lastSuccess) failure = "Немає Wi-Fi";
+    if ((!connected || !clockReady) && lastSuccess) {
+      failure = connected ? "Очікування часу" : "Немає Wi-Fi"; refreshFailed = true;
+    }
     previousConnected = connected; previousClockReady = clockReady;
     if (!showSetup) drawFooter();
   }
