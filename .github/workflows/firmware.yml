@@ -24,8 +24,11 @@ jobs:
           bash scripts/test-display-settings.sh
           bash scripts/test-poll-schedule.sh
           bash scripts/test-snapshot-reader.sh
+          bash scripts/test-update-status.sh
       - name: Build public Ultra firmware
         run: pio run -e ultra
+      - name: Check timestamp glyph colors with the real font decoder
+        run: python tests/update_glyph_test.py
       - name: Upload firmware
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

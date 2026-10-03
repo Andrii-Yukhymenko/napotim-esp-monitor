@@ -14,6 +14,7 @@
 #include "display_settings.h"
 #include "poll_schedule.h"
 #include "snapshot_reader.h"
+#include "update_status.h"
 #if __has_include("private_setup.h")
 #include "private_setup.h"
 #endif
@@ -309,7 +310,37 @@ bool updateStale() {
   return lastSuccess && (refreshFailed || WiFi.status() != WL_CONNECTED || time(nullptr) < 1760000000);
 }
 
-void drawUpdateStatus(bool force = false, bool clear = true) {
+// Misc Fixed metadata uses 6px advances and a 12px cell (baseline at row 10).
+constexpr int UPDATE_GLYPH_WIDTH = 6, UPDATE_GLYPH_HEIGHT = 12;
+constexpr int UPDATE_STATUS_X = 235 - (9 + 5) * UPDATE_GLYPH_WIDTH;
+
+class UpdateGlyphCanvas : public Adafruit_GFX {
+ public:
+  UpdateGlyphCanvas() : Adafruit_GFX(UPDATE_GLYPH_WIDTH, UPDATE_GLYPH_HEIGHT) {}
+  uint16_t pixels[UPDATE_GLYPH_WIDTH * UPDATE_GLYPH_HEIGHT];
+  void drawPixel(int16_t x, int16_t y, uint16_t color) override {
+    if (x >= 0 && x < UPDATE_GLYPH_WIDTH && y >= 0 && y < UPDATE_GLYPH_HEIGHT)
+      pixels[y * UPDATE_GLYPH_WIDTH + x] = color;
+  }
+};
+
+void drawUpdateGlyph(int x, char glyph, uint16_t color) {
+  // Compose background and glyph in 144 bytes of RAM, then replace the cell
+  // in one SPI transaction. Never expose a cleared cell on the LCD.
+  UpdateGlyphCanvas canvas;
+  canvas.fillScreen(BG);
+  U8G2_FOR_ADAFRUIT_GFX glyphFont;
+  glyphFont.begin(canvas);
+  glyphFont.setFont(u8g2_font_6x12_t_cyrillic);
+  // setFont() resets the library to opaque mode; never use its unset bg_color.
+  glyphFont.setFontMode(1);
+  glyphFont.setBackgroundColor(BG);
+  glyphFont.setForegroundColor(color);
+  glyphFont.drawGlyph(0, 10, glyph);
+  tft.drawRGBBitmap(x, 5, canvas.pixels, UPDATE_GLYPH_WIDTH, UPDATE_GLYPH_HEIGHT);
+}
+
+void drawUpdateStatus(bool force = false) {
   String stamp;
   if (lastSuccess) {
     time_t local = lastSuccess + localOffset(lastSuccess);
@@ -318,20 +349,21 @@ void drawUpdateStatus(bool force = false, bool clear = true) {
     stamp = formatted;
   }
   uint16_t color = updateStale() ? RED : MUTED;
-  static String paintedStamp;
-  static uint16_t paintedColor = MUTED;
-  if (!force && stamp == paintedStamp && color == paintedColor) return;
+  static UpdateStatusCache cache;
+  UpdateStatusChanges changes = cache.update(stamp.c_str(), color, force);
+  if (!changes.label && !changes.glyphs) return;
   font.setFont(u8g2_font_6x12_t_cyrillic);
   const String label = "Оновлено ";
-  int timeWidth = font.getUTF8Width("00:00");
   int labelWidth = font.getUTF8Width(label.c_str());
-  int x = 235 - timeWidth - labelWidth;
-  if (clear) tft.fillRect(x, 0, 240 - x, 19, BG);
-  if (stamp.length()) {
-    textAt(x, 15, label, MUTED, labelWidth);
-    textAt(x + labelWidth, 15, stamp, color, timeWidth);
+  if (changes.label) {
+    if (stamp.length()) textAt(UPDATE_STATUS_X, 15, label, MUTED, labelWidth);
+    else tft.fillRect(UPDATE_STATUS_X, 0, labelWidth, 19, BG);
   }
-  paintedStamp = stamp; paintedColor = color;
+  for (uint8_t i = 0; i < 5; ++i) {
+    if (changes.glyphs & (1 << i))
+      drawUpdateGlyph(UPDATE_STATUS_X + labelWidth + i * UPDATE_GLYPH_WIDTH,
+        stamp.length() ? stamp[i] : ' ', color);
+  }
 }
 
 void drawFooter(bool force = false, bool clear = true) {
@@ -372,7 +404,11 @@ void drawRow(uint8_t i, bool clear = true) {
 }
 
 void drawHeader(bool clear = true) {
-  if (clear) tft.fillRect(0, 0, 240, 40, BG);
+  if (clear) {
+    // Task counts/date can change without disturbing the update status.
+    tft.fillRect(0, 0, UPDATE_STATUS_X, 19, BG);
+    tft.fillRect(0, 19, 240, 21, BG);
+  }
   font.setFont(u8g2_font_6x13_t_cyrillic);
   textAt(5, 15, "НАПОТІМ", PURPLE);
   font.setFont(u8g2_font_6x12_t_cyrillic);
@@ -381,7 +417,7 @@ void drawHeader(bool clear = true) {
     int width = font.getUTF8Width(label.c_str());
     textAt((240 - width) / 2, 15, label, MUTED, width);
   }
-  drawUpdateStatus(true, false);
+  drawUpdateStatus(!clear);
   textAt(5, 32, String("Сьогодні: ") + todayTotal + "   Прострочено: " + overdueTotal, MUTED);
   tft.drawFastHLine(5, 38, 230, 0x2945);
 }
@@ -599,7 +635,7 @@ const char SETTINGS_PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="uk"><meta
 void configureWeb() {
   static bool uploadAllowed = false;
   static bool uploadStarted = false;
-  web.on("/health", HTTP_GET, []() { web.send(200, "application/json", "{\"firmware\":\"napotim-cube\",\"version\":\"1.1.5\"}"); });
+  web.on("/health", HTTP_GET, []() { web.send(200, "application/json", "{\"firmware\":\"napotim-cube\",\"version\":\"1.1.6\"}"); });
   web.on("/status", HTTP_GET, []() {
     if (!authenticated()) return;
     DynamicJsonDocument doc(2048);
