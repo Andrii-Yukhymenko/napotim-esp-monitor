@@ -430,7 +430,7 @@ void drawSetup() {
   textAt(8, 131, "Пароль:", MUTED);
   textAt(8, 151, webPassword, WHITE);
   textAt(8, 183, "Створіть ключ у Напотім:", MUTED);
-  textAt(8, 204, "Налаштування > Пристрої", MUTED);
+  textAt(8, 204, "Налаштування > Інтеграції", MUTED);
 }
 
 bool taskEqual(const Task& a, const Task& b) {
@@ -594,12 +594,12 @@ bool authenticated() {
   web.requestAuthentication(DIGEST_AUTH, "Napotim Cube"); return false;
 }
 
-const char SETTINGS_PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="uk"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Напотім · кубик</title><style>body{background:#101014;color:#eee;font:16px system-ui;max-width:520px;margin:40px auto;padding:20px}label{display:block;margin:20px 0}input,button{font:inherit;padding:10px;width:100%;box-sizing:border-box;background:#202026;color:#eee;border:1px solid #555;border-radius:8px}button{background:#7046b5}a{color:#bb9cec}</style><h1>Напотім · кубик</h1><p>Один нерухомий екран із найважливішими задачами. Оновлення раз на хвилину.</p><form method="post" action="/config"><label>Ключ із Напотім → Налаштування → Пристрої<input name="token" type="password" autocomplete="off" maxlength="48" placeholder="Залиште порожнім, щоб зберегти поточний"></label><label>Яскравість: 1–100<input name="brightness" type="number" min="1" max="100" value="22"></label><label>Поворот: 0–3<input name="rotation" type="number" min="0" max="3" value="0"></label><button>Зберегти</button></form><hr><h2>Wi-Fi</h2><form method="post" action="/wifi"><label>Назва мережі<input name="ssid" required maxlength="32"></label><label>Пароль<input name="password" type="password" autocomplete="off" minlength="8" maxlength="63" required></label><button>Підключити</button></form><p><a href="/update">Оновити прошивку</a></p></html>)HTML";
+const char SETTINGS_PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="uk"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Напотім · кубик</title><style>body{background:#101014;color:#eee;font:16px system-ui;max-width:520px;margin:40px auto;padding:20px}label{display:block;margin:20px 0}input,button{font:inherit;padding:10px;width:100%;box-sizing:border-box;background:#202026;color:#eee;border:1px solid #555;border-radius:8px}button{background:#7046b5}a{color:#bb9cec}</style><h1>Напотім · кубик</h1><p>Один нерухомий екран із найважливішими задачами. Оновлення раз на хвилину.</p><form method="post" action="/config"><label>Ключ із Напотім → Налаштування → Інтеграції<input name="token" type="password" autocomplete="off" maxlength="48" placeholder="Залиште порожнім, щоб зберегти поточний"></label><label>Яскравість: 1–100<input name="brightness" type="number" min="1" max="100" value="22"></label><label>Поворот: 0–3<input name="rotation" type="number" min="0" max="3" value="0"></label><button>Зберегти</button></form><hr><h2>Wi-Fi</h2><form method="post" action="/wifi"><label>Назва мережі<input name="ssid" required maxlength="32"></label><label>Пароль<input name="password" type="password" autocomplete="off" minlength="8" maxlength="63" required></label><button>Підключити</button></form><p><a href="/update">Оновити прошивку</a></p></html>)HTML";
 
 void configureWeb() {
   static bool uploadAllowed = false;
   static bool uploadStarted = false;
-  web.on("/health", HTTP_GET, []() { web.send(200, "application/json", "{\"firmware\":\"napotim-cube\",\"version\":\"1.1.4\"}"); });
+  web.on("/health", HTTP_GET, []() { web.send(200, "application/json", "{\"firmware\":\"napotim-cube\",\"version\":\"1.1.5\"}"); });
   web.on("/status", HTTP_GET, []() {
     if (!authenticated()) return;
     DynamicJsonDocument doc(2048);
