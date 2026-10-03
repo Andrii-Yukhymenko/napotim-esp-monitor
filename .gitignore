@@ -1,0 +1,8 @@
+.venv/
+.pio/
+.secrets/
+include/private_wifi.h
+include/private_setup.h
+__pycache__/
+*.bin
+*.bin.gz
