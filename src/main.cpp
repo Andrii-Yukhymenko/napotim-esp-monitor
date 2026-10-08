@@ -12,6 +12,7 @@
 #include "trust_anchor.h"
 #include "title_font.h"
 #include "display_settings.h"
+#include "night_mode.h"
 #include "poll_schedule.h"
 #include "snapshot_reader.h"
 #include "update_status.h"
@@ -35,9 +36,10 @@ constexpr uint8_t ROWS = 6;
 const char* API_URL = "https://napotim.duckdns.org/api/device/v1/today";
 String token, webPassword;
 DisplaySettings displaySettings;
+NightMode nightMode;
 uint8_t& brightness = displaySettings.brightness;
 uint8_t& rotation = displaySettings.rotation;
-bool settingsRemote = false, timezoneKnown = false;
+bool settingsRemote = false, settingsLocal = false, timezoneKnown = false;
 OffsetTransition timezoneChanges[4];
 uint8_t timezoneChangeCount = 0;
 uint16_t effectiveBrightness = 2200;
@@ -89,6 +91,7 @@ void writeDisplaySettings(JsonObject out, const DisplaySettings& settings) {
   out["brightness"] = settings.brightness; out["rotation"] = settings.rotation;
   out["day_brightness"] = settings.dayBrightness; out["night_brightness"] = settings.nightBrightness;
   out["day_start"] = scheduleTime(settings.dayStart); out["night_start"] = scheduleTime(settings.nightStart);
+  out["sleep_enabled"] = settings.sleepEnabled; out["sleep_start"] = scheduleTime(settings.sleepStart);
 }
 
 bool parseScheduleTime(JsonVariantConst value, uint16_t& minute) {
@@ -110,10 +113,17 @@ bool parseDisplaySettings(JsonVariantConst value, DisplaySettings& out) {
   if (!value["rotation"].is<int>() || value["rotation"].as<int>() < 0 || value["rotation"].as<int>() > 3 ||
       !parseScheduleTime(value["day_start"], out.dayStart) || !parseScheduleTime(value["night_start"], out.nightStart)) return false;
   int duration = (out.nightStart - out.dayStart + 1440) % 1440;
-  if (duration < 15 || duration > 1425) return false;
+  if (value["mode"] == "scheduled" && (duration < 15 || duration > 1425)) return false;
   out.brightness = value["brightness"]; out.rotation = value["rotation"];
   out.dayBrightness = value["day_brightness"]; out.nightBrightness = value["night_brightness"];
-  out.scheduled = value["mode"] == "scheduled"; return true;
+  out.scheduled = value["mode"] == "scheduled";
+  // Older servers/config files have no sleep fields: preserve compatibility.
+  out.sleepEnabled = false; out.sleepStart = 0;
+  if (value.as<JsonObjectConst>().containsKey("sleep_enabled")) {
+    if (!value["sleep_enabled"].is<bool>() || !parseScheduleTime(value["sleep_start"], out.sleepStart)) return false;
+    out.sleepEnabled = value["sleep_enabled"];
+  } else if (!value["sleep_start"].isNull()) return false;
+  return validSleepSchedule(out);
 }
 
 void writeTimezoneChanges(JsonArray out) {
@@ -142,6 +152,7 @@ void saveConfig() {
   doc["brightness"] = brightness; doc["rotation"] = rotation;
   writeDisplaySettings(doc.createNestedObject("display_settings"), displaySettings);
   doc["settings_remote"] = settingsRemote; doc["timezone_known"] = timezoneKnown;
+  doc["settings_local"] = settingsLocal;
   doc["utc_offset_seconds"] = utcOffset;
   writeTimezoneChanges(doc.createNestedArray("timezone_transitions"));
   File file = LittleFS.open("/config.tmp", "w");
@@ -162,6 +173,7 @@ void loadConfig() {
     DisplaySettings restored = displaySettings;
     if (parseDisplaySettings(doc["display_settings"], restored)) {
       displaySettings = restored; settingsRemote = doc["settings_remote"] | false;
+      settingsLocal = doc["settings_local"] | false;
     }
     utcOffset = doc["utc_offset_seconds"] | 0;
     timezoneKnown = (doc["timezone_known"] | false) && utcOffset >= -86400 && utcOffset <= 86400 &&
@@ -184,8 +196,14 @@ void setBrightness() {
   time_t now = time(nullptr);
   bool clockReady = timezoneKnown && now >= 1760000000;
   effectiveBrightness = brightnessAt(displaySettings, (now % 86400 + localOffset(now)) % 86400, clockReady);
+  if (nightMode.blank()) effectiveBrightness = 0;
+  else if (nightMode.notice()) effectiveBrightness = 500;
   int pwm = 1023 - static_cast<uint32_t>(effectiveBrightness) * 1023 / 10000;
-  if (pwm != lastBrightnessPwm) { analogWrite(5, pwm); lastBrightnessPwm = pwm; }
+  if (pwm != lastBrightnessPwm) {
+    if (pwm == 1023) { analogWrite(5, 0); digitalWrite(5, HIGH); }
+    else analogWrite(5, pwm);
+    lastBrightnessPwm = pwm;
+  }
 }
 
 String clip(String value, int width) {
@@ -367,6 +385,7 @@ void drawUpdateStatus(bool force = false) {
 }
 
 void drawFooter(bool force = false, bool clear = true) {
+  if (nightMode.state != NightMode::Awake) return;
   drawUpdateStatus();
   String message;
   int baseline = lastSuccess ? 225 : 227;
@@ -386,6 +405,7 @@ void drawFooter(bool force = false, bool clear = true) {
 }
 
 void drawRow(uint8_t i, bool clear = true) {
+  if (nightMode.state != NightMode::Awake) return;
   int y = 43 + i * 28;
   if (clear) tft.fillRect(0, y, 240, 28, BG);
   if (i >= taskCount) return;
@@ -404,6 +424,7 @@ void drawRow(uint8_t i, bool clear = true) {
 }
 
 void drawHeader(bool clear = true) {
+  if (nightMode.state != NightMode::Awake) return;
   if (clear) {
     // Task counts/date can change without disturbing the update status.
     tft.fillRect(0, 0, UPDATE_STATUS_X, 19, BG);
@@ -422,13 +443,14 @@ void drawHeader(bool clear = true) {
   tft.drawFastHLine(5, 38, 230, 0x2945);
 }
 
-void drawSetup() {
+void drawSetup(bool force = false) {
+  if (nightMode.state != NightMode::Awake) return;
   bool connected = WiFi.status() == WL_CONNECTED;
   setupAddress = connected ? WiFi.localIP().toString() : "192.168.4.1";
   static bool painted = false, paintedConfigured = false;
   static uint8_t paintedRotation = UINT8_MAX;
   static String paintedStage, paintedWifi, paintedAddress;
-  bool full = !painted || configured != paintedConfigured || rotation != paintedRotation;
+  bool full = force || !painted || configured != paintedConfigured || rotation != paintedRotation;
   if (full) {
     tft.fillScreen(BG);
     painted = true; paintedConfigured = configured; paintedRotation = rotation;
@@ -474,6 +496,49 @@ bool taskEqual(const Task& a, const Task& b) {
     a.dueTime == b.dueTime && a.color == b.color && a.high == b.high && a.overdue == b.overdue && a.today == b.today;
 }
 
+void drawNightNotice() {
+  tft.fillScreen(BG);
+  font.setFont(u8g2_font_6x13_t_cyrillic);
+  textAt(8, 35, "НАПОТІМ", PURPLE);
+  if (nightMode.state == NightMode::SleepNotice) {
+    textAt(8, 100, "Сон до " + scheduleTime(displaySettings.dayStart), WHITE);
+    textAt(8, 130, "Нічний режим", MUTED);
+    textAt(8, 165, "Екран зараз вимкнеться", MUTED);
+  } else {
+    textAt(8, 85, "Очікування точного часу", WHITE);
+    textAt(8, 115, "Після вимкнення живлення", MUTED);
+    textAt(8, 135, "потрібні Wi-Fi та інтернет", MUTED);
+    textAt(8, 175, "Екран тимчасово вимкнеться", MUTED);
+    textAt(8, 195, "Підключення триває", MUTED);
+  }
+}
+
+void updateNightMode() {
+  time_t now = time(nullptr);
+  bool wasBlank = nightMode.blank();
+  if (!nightMode.update(displaySettings, configured, timezoneKnown && now >= 1760000000,
+      (now % 86400 + localOffset(now)) % 86400, millis())) return;
+  if (nightMode.blank()) {
+    setBrightness(); // Backlight fully off before putting ST7789 to sleep.
+    tft.enableDisplay(false); tft.enableSleep(true);
+    WiFi.setSleepMode(WIFI_MODEM_SLEEP);
+  } else {
+    if (wasBlank) { tft.enableSleep(false); delay(120); tft.enableDisplay(true); }
+    if (nightMode.notice()) drawNightNotice();
+    else {
+      tft.fillScreen(BG);
+      if (showSetup) drawSetup(true);
+      else {
+        drawHeader(false); for (uint8_t i = 0; i < ROWS; ++i) drawRow(i, false);
+        if (!taskCount) { font.setFont(u8g2_font_6x13_t_cyrillic); textAt(15, 90, "На сьогодні все виконано", WHITE); }
+        drawFooter(true, false);
+      }
+      pollSchedule.next = millis(); // Refresh on wake, even after a failed poll.
+    }
+    setBrightness();
+  }
+}
+
 bool applySnapshot(const String& payload) {
   markStage(6);
   DynamicJsonDocument doc(6144);
@@ -487,6 +552,7 @@ bool applySnapshot(const String& payload) {
   DisplaySettings freshSettings = displaySettings;
   bool hasSettings = !doc["display_settings"].isNull();
   if (hasSettings && !parseDisplaySettings(doc["display_settings"], freshSettings)) { dataError = "display_settings_schema"; return false; }
+  if (settingsLocal) freshSettings = displaySettings;
   OffsetTransition freshChanges[4]; uint8_t freshChangeCount = 0;
   int freshOffset = doc["utc_offset_seconds"];
   if (freshOffset < -86400 || freshOffset > 86400 ||
@@ -520,6 +586,14 @@ bool applySnapshot(const String& payload) {
   bool newHeader = first || newDate != date || todayTotal != doc["today_total"].as<int>() || overdueTotal != doc["overdue_total"].as<int>();
   date = newDate; todayTotal = doc["today_total"]; overdueTotal = doc["overdue_total"];
   hiddenCount = doc["hidden_count"]; utcOffset = doc["utc_offset_seconds"];
+  if (nightMode.state != NightMode::Awake) {
+    // Keep the snapshot fresh without waking/painting over the night notice.
+    taskCount = count; for (uint8_t i = 0; i < ROWS; ++i) tasks[i] = fresh[i];
+    showSetup = false; lastSuccess = time(nullptr); failure = ""; refreshFailed = false;
+    if (nightMode.notice()) drawNightNotice();
+    if (firstSuccessMs == UINT32_MAX) firstSuccessMs = millis();
+    return true;
+  }
   bool screenCleared = first;
   if (first) tft.fillScreen(BG);
   markStage(7);
@@ -630,15 +704,15 @@ bool authenticated() {
   web.requestAuthentication(DIGEST_AUTH, "Napotim Cube"); return false;
 }
 
-const char SETTINGS_PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="uk"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Напотім · кубик</title><style>body{background:#101014;color:#eee;font:16px system-ui;max-width:520px;margin:40px auto;padding:20px}label{display:block;margin:20px 0}input,button{font:inherit;padding:10px;width:100%;box-sizing:border-box;background:#202026;color:#eee;border:1px solid #555;border-radius:8px}button{background:#7046b5}a{color:#bb9cec}</style><h1>Напотім · кубик</h1><p>Один нерухомий екран із найважливішими задачами. Оновлення раз на хвилину.</p><form method="post" action="/config"><label>Ключ із Напотім → Налаштування → Інтеграції<input name="token" type="password" autocomplete="off" maxlength="48" placeholder="Залиште порожнім, щоб зберегти поточний"></label><label>Яскравість: 1–100<input name="brightness" type="number" min="1" max="100" value="22"></label><label>Поворот: 0–3<input name="rotation" type="number" min="0" max="3" value="0"></label><button>Зберегти</button></form><hr><h2>Wi-Fi</h2><form method="post" action="/wifi"><label>Назва мережі<input name="ssid" required maxlength="32"></label><label>Пароль<input name="password" type="password" autocomplete="off" minlength="8" maxlength="63" required></label><button>Підключити</button></form><p><a href="/update">Оновити прошивку</a></p></html>)HTML";
+const char SETTINGS_PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="uk"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Напотім · кубик</title><style>body{background:#101014;color:#eee;font:16px system-ui;max-width:520px;margin:40px auto;padding:20px}label{display:block;margin:20px 0}input,select,button{font:inherit;padding:10px;width:100%;box-sizing:border-box;background:#202026;color:#eee;border:1px solid #555;border-radius:8px}input[type=checkbox]{width:auto}button{background:#7046b5}a{color:#bb9cec}</style><h1>Напотім · кубик</h1><p>Оновлення задач раз на хвилину. Налаштування зберігаються після вимкнення живлення.</p><form method="post" action="/config"><label>Ключ із Напотім → Налаштування → Інтеграції<input name="token" type="password" autocomplete="off" maxlength="48" placeholder="Залиште порожнім, щоб зберегти поточний"></label><label>Джерело налаштувань<select name="source"><option value="remote" {{remote}}>Напотім</option><option value="local" {{local}}>Ця плата</option></select></label><p>У режимі «Ця плата» наведені нижче параметри мають перевагу. У режимі «Напотім» вони заміняться під час синхронізації.</p><label>Яскравість: 1–100<input name="brightness" type="number" min="1" max="100" value="{{brightness}}" required></label><label>Поворот: 0–3<input name="rotation" type="number" min="0" max="3" value="{{rotation}}" required></label><label><input name="scheduled" type="checkbox" {{scheduled}}> Яскравість за розкладом</label><label>Денна яскравість<input name="day_brightness" type="number" min="1" max="100" value="{{day_brightness}}" required></label><label>Вечірня яскравість<input name="night_brightness" type="number" min="1" max="100" value="{{night_brightness}}" required></label><label>Початок дня / пробудження<input name="day_start" type="time" value="{{day_start}}" required></label><label>Початок вечора<input name="night_start" type="time" value="{{night_start}}" required></label><label><input name="sleep_enabled" type="checkbox" {{sleep_enabled}}> Нічний сон: повністю вимикати екран</label><label>Початок сну<input name="sleep_start" type="time" value="{{sleep_start}}" required></label><p>Сон працює і з ручною яскравістю. Часовий пояс береться з Напотім. Після нічного ввімкнення показується повідомлення про сон. Якщо після втрати живлення час невідомий, через 15 секунд екран гасне до синхронізації; підключення триває.</p><button>Зберегти</button></form><hr><h2>Wi-Fi</h2><form method="post" action="/wifi"><label>Назва мережі<input name="ssid" required maxlength="32"></label><label>Пароль<input name="password" type="password" autocomplete="off" minlength="8" maxlength="63" required></label><button>Підключити</button></form><p><a href="/update">Оновити прошивку</a></p></html>)HTML";
 
 void configureWeb() {
   static bool uploadAllowed = false;
   static bool uploadStarted = false;
-  web.on("/health", HTTP_GET, []() { web.send(200, "application/json", "{\"firmware\":\"napotim-cube\",\"version\":\"1.1.6\"}"); });
+  web.on("/health", HTTP_GET, []() { web.send(200, "application/json", "{\"firmware\":\"napotim-cube\",\"version\":\"1.2.0\"}"); });
   web.on("/status", HTTP_GET, []() {
     if (!authenticated()) return;
-    DynamicJsonDocument doc(2048);
+    DynamicJsonDocument doc(2560);
     doc["configured"]=configured; doc["wifi_connected"]=WiFi.status()==WL_CONNECTED;
     doc["free_heap"]=ESP.getFreeHeap(); doc["largest_heap_block"]=ESP.getMaxFreeBlockSize();
     doc["http_status"]=lastHttpStatus; doc["tls_error"]=lastTlsError;
@@ -647,7 +721,11 @@ void configureWeb() {
     doc["hidden_count"]=hiddenCount; doc["update_stale"]=updateStale();
     doc["brightness"]=brightness; doc["rotation"]=rotation;
     doc["effective_brightness"]=effectiveBrightness / 100.0;
-    doc["settings_remote"]=settingsRemote; doc["timezone_known"]=timezoneKnown;
+    doc["settings_remote"]=settingsRemote; doc["settings_local"]=settingsLocal; doc["timezone_known"]=timezoneKnown;
+    const char* states[] = {"awake", "sleep_notice", "sleeping", "clock_notice", "waiting_for_clock"};
+    doc["night_state"] = states[nightMode.state]; doc["screen_off"] = nightMode.blank();
+    doc["sleep_strategy"] = "display_sleep_with_running_clock";
+    doc["wake_time"] = scheduleTime(displaySettings.dayStart);
     writeDisplaySettings(doc.createNestedObject("display_settings"), displaySettings);
     doc["error"]=failure; doc["uptime_seconds"]=millis()/1000;
     doc["station_ip"]=WiFi.localIP().toString(); doc["wifi_status"]=static_cast<int>(WiFi.status());
@@ -670,8 +748,15 @@ void configureWeb() {
   web.on("/", HTTP_GET, []() {
     if (!authenticated()) return;
     String page = FPSTR(SETTINGS_PAGE);
-    page.replace("name=\"brightness\" type=\"number\" min=\"1\" max=\"100\" value=\"22\"", "name=\"brightness\" type=\"number\" min=\"1\" max=\"100\" value=\"" + String(brightness) + "\"");
-    page.replace("name=\"rotation\" type=\"number\" min=\"0\" max=\"3\" value=\"0\"", "name=\"rotation\" type=\"number\" min=\"0\" max=\"3\" value=\"" + String(rotation) + "\"");
+    page.replace("{{brightness}}", String(brightness)); page.replace("{{rotation}}", String(rotation));
+    page.replace("{{day_brightness}}", String(displaySettings.dayBrightness));
+    page.replace("{{night_brightness}}", String(displaySettings.nightBrightness));
+    page.replace("{{day_start}}", scheduleTime(displaySettings.dayStart));
+    page.replace("{{night_start}}", scheduleTime(displaySettings.nightStart));
+    page.replace("{{sleep_start}}", scheduleTime(displaySettings.sleepStart));
+    page.replace("{{scheduled}}", displaySettings.scheduled ? "checked" : "");
+    page.replace("{{sleep_enabled}}", displaySettings.sleepEnabled ? "checked" : "");
+    page.replace("{{local}}", settingsLocal ? "selected" : ""); page.replace("{{remote}}", settingsLocal ? "" : "selected");
     web.sendHeader("Cache-Control", "no-store"); web.send(200, "text/html; charset=utf-8", page);
   });
   web.on("/config", HTTP_POST, []() {
@@ -680,21 +765,47 @@ void configureWeb() {
     bool valid = supplied.length() == 48 && supplied.startsWith("nptd_");
     for (uint8_t i = 5; valid && i < supplied.length(); ++i) valid = isalnum(supplied[i]) || supplied[i] == '_' || supplied[i] == '-';
     if (supplied.length() && !valid) { web.send(400, "text/plain; charset=utf-8", "Некоректний ключ пристрою."); return; }
-    if (supplied.length() && supplied != token) { settingsRemote = false; displaySettings.scheduled = false; }
+    DisplaySettings fresh = displaySettings;
+    bool fullForm = web.hasArg("source");
+    if (fullForm) {
+      if (web.arg("source") != "local" && web.arg("source") != "remote") { web.send(400, "text/plain", "Invalid settings source"); return; }
+      DynamicJsonDocument doc(768);
+      doc["mode"] = web.hasArg("scheduled") ? "scheduled" : "manual";
+      for (const char* key : {"brightness", "rotation", "day_brightness", "night_brightness"}) {
+        String value = web.arg(key);
+        if (!value.length() || value.length() > 3) { web.send(400, "text/plain", "Invalid number"); return; }
+        for (unsigned i = 0; i < value.length(); ++i) if (!isdigit(value[i])) { web.send(400, "text/plain", "Invalid number"); return; }
+        doc[key] = value.toInt();
+      }
+      for (const char* key : {"day_start", "night_start", "sleep_start"}) doc[key] = web.arg(key);
+      doc["sleep_enabled"] = web.hasArg("sleep_enabled");
+      if (!parseDisplaySettings(doc.as<JsonVariantConst>(), fresh)) {
+        web.send(400, "text/plain; charset=utf-8", "Перевірте розклад: день → вечір → сон → день, між початками щонайменше 15 хвилин. Для ручної яскравості потрібні лише різні часи сну й пробудження."); return;
+      }
+    } else {
+      // Compatibility with older provisioning clients; omitted sleep fields persist.
+      if (web.hasArg("rotation")) fresh.rotation = constrain(web.arg("rotation").toInt(), 0, 3);
+      if (web.hasArg("brightness")) { fresh.brightness = constrain(web.arg("brightness").toInt(), 1, 100); fresh.scheduled = false; }
+    }
+    if (supplied.length() && supplied != token) settingsRemote = false;
     if (supplied.length()) token = supplied;
-    uint8_t newRotation = web.hasArg("rotation") ? constrain(web.arg("rotation").toInt(), 0, 3) : rotation;
-    if (web.hasArg("brightness")) { brightness = constrain(web.arg("brightness").toInt(), 1, 100); displaySettings.scheduled = false; }
-    bool rotate = rotation != newRotation; rotation = newRotation;
-    configured = token.length() == 48; saveConfig(); setBrightness();
+    bool rotate = rotation != fresh.rotation;
+    displaySettings = fresh;
+    if (fullForm) settingsLocal = web.arg("source") == "local";
+    configured = token.length() == 48; saveConfig();
     failure = "Очікування синхронізації";
-    if (rotate) {
-      tft.setRotation(rotation);
-      if (showSetup) drawSetup();
+    if (rotate) tft.setRotation(rotation);
+    updateNightMode(); setBrightness();
+    if (nightMode.notice()) drawNightNotice();
+    else if (nightMode.state == NightMode::Awake) {
+      if (showSetup) drawSetup(true);
       else { tft.fillScreen(BG); drawHeader(false); for (uint8_t i=0;i<ROWS;++i) drawRow(i, false); drawFooter(true, false); }
     }
-    else if (showSetup) drawSetup();
     pollSchedule.next = millis() + 1500; pollSchedule.interval = PollSchedule::NORMAL_INTERVAL;
-    web.sendHeader("Cache-Control", "no-store"); web.send(200, "text/plain; charset=utf-8", "Збережено. Екран оновиться після синхронізації.");
+    web.sendHeader("Cache-Control", "no-store");
+    web.send(200, "text/plain; charset=utf-8", settingsLocal ?
+      "Збережено на платі. Локальні налаштування застосовано." :
+      "Збережено. Налаштування з Напотім надійдуть після синхронізації.");
   });
   web.on("/wifi", HTTP_POST, []() {
     if (!authenticated()) return;
@@ -744,9 +855,11 @@ void setup() {
   WiFi.persistent(false); WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(true); WiFi.begin();
   setupStarted = millis();
   configTime(0, 0, "time.cloudflare.com", "pool.ntp.org");
-  pinMode(5, OUTPUT); analogWriteRange(1023);
+  pinMode(5, OUTPUT); digitalWrite(5, HIGH); analogWriteRange(1023);
   tft.init(240, 240, SPI_MODE3); font.begin(tft); font.setFontMode(1); font.setFontDirection(0);
-  loadConfig(); tft.setRotation(rotation); setBrightness();
+  loadConfig(); tft.setRotation(rotation);
+  WiFi.setSleepMode(WIFI_MODEM_SLEEP);
+  updateNightMode(); setBrightness();
   configureWeb();
   if (configured) drawSetup();
   else { tft.fillScreen(BG); font.setFont(u8g2_font_6x13_t_cyrillic); textAt(8, 25, "НАПОТІМ · підключення…", PURPLE); }
@@ -754,6 +867,7 @@ void setup() {
 
 void loop() {
   web.handleClient();
+  updateNightMode();
   static uint32_t lastBrightnessSecond = UINT32_MAX;
   uint32_t second = millis() / 1000;
   if (second != lastBrightnessSecond) { setBrightness(); lastBrightnessSecond = second; }
@@ -782,7 +896,8 @@ void loop() {
   if (apActive && WiFi.status() == WL_CONNECTED && configured) { WiFi.softAPdisconnect(true); WiFi.mode(WIFI_STA); apActive = false; }
   pollSchedule.observeReadiness(connected && clockReady, millis());
   if (configured && pollSchedule.due(millis())) { poll(); pollSchedule.scheduleFrom(millis()); }
+  updateNightMode();
   uint32_t minute = millis() / 60000;
   if (lastSuccess && minute != lastFooterMinute) { drawFooter(); lastFooterMinute = minute; }
-  yield();
+  delay(nightMode.blank() ? 20 : 1);
 }

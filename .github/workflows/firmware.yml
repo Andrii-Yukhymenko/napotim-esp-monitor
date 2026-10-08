@@ -22,6 +22,7 @@ jobs:
       - name: Check schedules and response handling
         run: |
           bash scripts/test-display-settings.sh
+          bash scripts/test-night-mode.sh
           bash scripts/test-poll-schedule.sh
           bash scripts/test-snapshot-reader.sh
           bash scripts/test-update-status.sh
