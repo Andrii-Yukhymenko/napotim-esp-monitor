@@ -26,6 +26,7 @@ jobs:
           bash scripts/test-poll-schedule.sh
           bash scripts/test-snapshot-reader.sh
           bash scripts/test-update-status.sh
+          bash scripts/test-theme-packet.sh
       - name: Build public Ultra firmware
         run: pio run -e ultra
       - name: Check timestamp glyph colors with the real font decoder
