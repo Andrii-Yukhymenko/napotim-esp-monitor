@@ -1,22 +1,24 @@
 #pragma once
 #include <LittleFS.h>
 #include <Adafruit_ST7789.h>
+#include <memory>
+#include <utility>
 #include "theme_packet.h"
 
 class ThemeDisplay {
  public:
   ThemeHeader header;
   String id, theme;
-  uint8_t glyphs[THEME_MAX_GLYPH_BYTES];
+  std::unique_ptr<uint8_t[]> glyphs;
   bool active=false;
   String paintedStamp;
   bool paintedStale=false;
   void clear() {
-    active=false;id="";theme="";paintedStamp="";
+    active=false;id="";theme="";paintedStamp="";glyphs.reset();
     LittleFS.remove("/theme.pending");LittleFS.remove("/theme.frame");
   }
-  void activate(const ThemeHeader& h, const String& frameId, const String& themeId, const uint8_t* preparedGlyphs) {
-    memcpy(glyphs,preparedGlyphs,h.atlasBytes);
+  void activate(const ThemeHeader& h, const String& frameId, const String& themeId, std::unique_ptr<uint8_t[]> preparedGlyphs) {
+    glyphs=std::move(preparedGlyphs);
     header=h;id=frameId;theme=themeId;active=true;paintedStamp="";
   }
   template<class Draw>
