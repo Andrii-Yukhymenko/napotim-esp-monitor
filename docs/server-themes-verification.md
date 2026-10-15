@@ -6,6 +6,31 @@ Initial implementation was local only. The subsequent user-requested review
 authorizes committing and pushing the two feature branches; no production deploy
 or pull request is part of this operation.
 
+## HTTPS pairing follow-up: firmware 2.0.2, 2026-10-15
+
+The user explicitly requested connecting the cube to their main Napotim account.
+The authenticated local restore-source operation restored the saved pairing;
+the device key was not extracted or printed. No server code or account settings
+were changed during this setup.
+
+The first real HTTPS run exposed TLS allocation error -1000 while downloading
+the frame, followed by unreliable polling. Free the manifest's 4096-byte JSON
+pool before the next handshake, copying all needed fields first. Store only the
+active theme's actual bounded glyph atlas on the heap and transfer the prepared
+atlas without an extra copy. Static RAM drops from 39464 to 36832 bytes.
+
+The final 2.0.2 build was installed through authenticated local OTA. The real
+HTTPS API supplied a Classic frame, followed by successful explicit refresh and
+automatic minute polling with the same boot counter. The frame download count
+remained one while the successful-update time advanced. TLS, frame and data
+errors were empty/zero, the display was awake, and free heap was about 35 KB.
+Brightness, rotation and night sleep remained controlled by the account.
+
+All six C++ test scripts and the real U8g2 glyph test pass. Both the installed
+private build and a public Ultra build without the private setup header pass.
+Follow-up branch: `codex/https-frame-memory`. The earlier local-only test limits
+below describe previous iterations, before this explicitly authorized HTTPS pairing.
+
 ## Pre-publication code review
 
 Reviewed both repositories' changes from their pre-feature bases. Confirmed and

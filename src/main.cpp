@@ -768,7 +768,7 @@ bool downloadFrame(const String& id, const String& theme, unsigned expected, The
   if (error) { frameError=error;LittleFS.remove("/theme.pending");return false; }
   if (!LittleFS.rename("/theme.pending","/theme.frame")) { frameError="frame_commit";LittleFS.remove("/theme.pending");return false; }
   // No fallible file read occurs after replacing the previous accepted file.
-  themeDisplay.activate(header,id,theme,preparedGlyphs.get());
+  themeDisplay.activate(header,id,theme,std::move(preparedGlyphs));
   ++frameDownloads;return true;
 }
 
@@ -814,6 +814,7 @@ void poll() {
       int offset=doc["utc_offset_seconds"]|100000;
       int visible=doc["visible_count"]|-1,total=doc["total"]|-1;
       String frameDate=doc["date"]|"";
+      int freshToday=doc["today_total"]|-1,freshOverdue=doc["overdue_total"]|-1;
       bool validDate=frameDate.length()==10 && frameDate[4]=='-' && frameDate[7]=='-';
       for (unsigned i=0;i<frameDate.length() && validDate;++i)
         if (i!=4 && i!=7 && !isdigit(frameDate[i])) validDate=false;
@@ -828,8 +829,10 @@ void poll() {
           !parseDisplaySettings(doc["display_settings"],fresh) ||
           !parseTimezoneChanges(doc["timezone_transitions"],changes,changeCount)) dataError="manifest_schema";
       else {
-        // Release JSON-backed payload before acquiring a second TLS connection.
+        // The manifest pool must also be freed before the second TLS handshake.
+        // clear() alone retains its 4 KB allocation; only copied values survive.
         payload="";
+        doc.clear();doc.shrinkToFit();
         bool changed=!themeDisplay.active || id!=themeDisplay.id;
         ThemeHeader header=themeDisplay.header;
         bool ready=!changed || downloadFrame(id,theme,bytes,header);
@@ -844,7 +847,7 @@ void poll() {
           for (uint8_t i=0;i<changeCount;++i) timezoneChanges[i]=changes[i];
           if (configChanged) saveConfig();
           if (rotated) tft.setRotation(rotation);
-          taskCount=visible;hiddenCount=total-visible;todayTotal=doc["today_total"];overdueTotal=doc["overdue_total"];
+          taskCount=visible;hiddenCount=total-visible;todayTotal=freshToday;overdueTotal=freshOverdue;
           date=frameDate;
           bool full=changed || showSetup || rotated;showSetup=false;
           updateNightMode();setBrightness();
@@ -891,7 +894,7 @@ const char SETTINGS_PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="uk"><meta
 void configureWeb() {
   static bool uploadAllowed = false;
   static bool uploadStarted = false;
-  web.on("/health", HTTP_GET, []() { web.send(200, "application/json", "{\"firmware\":\"napotim-cube\",\"version\":\"2.0.1\"}"); });
+  web.on("/health", HTTP_GET, []() { web.send(200, "application/json", "{\"firmware\":\"napotim-cube\",\"version\":\"2.0.2\"}"); });
   web.on("/refresh",HTTP_POST,[]() {
     if (!authenticated()) return;
     legacyApi=false;
