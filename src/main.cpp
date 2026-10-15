@@ -8,6 +8,8 @@
 #include <Adafruit_ST7789.h>
 #include <U8g2_for_Adafruit_GFX.h>
 #include <time.h>
+#include <memory>
+#include <new>
 #include <user_interface.h>
 #include "trust_anchor.h"
 #include "title_font.h"
@@ -16,6 +18,8 @@
 #include "poll_schedule.h"
 #include "snapshot_reader.h"
 #include "update_status.h"
+#include "theme_display.h"
+#include "api_origin.h"
 #if __has_include("private_setup.h")
 #include "private_setup.h"
 #endif
@@ -33,7 +37,14 @@ constexpr uint16_t PURPLE = 0x795B, RED = 0xF924;
 // The original glyph pixels retain RED; white titles use no edge.
 constexpr uint16_t RED_TITLE_EDGE = 0x68A2;
 constexpr uint8_t ROWS = 6;
-const char* API_URL = "https://napotim.duckdns.org/api/device/v1/today";
+const char* DEFAULT_ORIGIN = "https://napotim.duckdns.org";
+String apiOrigin;
+ThemeDisplay themeDisplay;
+bool legacyApi=false;
+bool sourceConfirmationNeeded=false;
+uint32_t nextV2Probe=0;
+String frameError;
+uint32_t frameDownloads=0;
 String token, webPassword;
 DisplaySettings displaySettings;
 NightMode nightMode;
@@ -149,6 +160,8 @@ bool parseTimezoneChanges(JsonVariantConst value, OffsetTransition* out, uint8_t
 void saveConfig() {
   DynamicJsonDocument doc(1536);
   doc["token"] = token; doc["web_password"] = webPassword;
+  doc["api_origin"] = apiOrigin;
+  doc["source_confirmed"] = !sourceConfirmationNeeded;
   doc["brightness"] = brightness; doc["rotation"] = rotation;
   writeDisplaySettings(doc.createNestedObject("display_settings"), displaySettings);
   doc["settings_remote"] = settingsRemote; doc["timezone_known"] = timezoneKnown;
@@ -168,6 +181,9 @@ void loadConfig() {
   File file = LittleFS.open("/config.json", "r");
   if (file && !deserializeJson(doc, file)) {
     token = doc["token"] | ""; webPassword = doc["web_password"] | "";
+    apiOrigin = doc["api_origin"] | "";
+    // Require an explicit source after upgrading a v1 configuration.
+    sourceConfirmationNeeded=!(doc["source_confirmed"]|false);
     brightness = constrain(doc["brightness"] | 22, 1, 100);
     rotation = constrain(doc["rotation"] | 2, 0, 3);
     DisplaySettings restored = displaySettings;
@@ -367,6 +383,10 @@ void drawUpdateStatus(bool force = false) {
     stamp = formatted;
   }
   uint16_t color = updateStale() ? RED : MUTED;
+  if (themeDisplay.active) {
+    themeDisplay.status(tft,stamp,updateStale(),force);
+    return;
+  }
   static UpdateStatusCache cache;
   UpdateStatusChanges changes = cache.update(stamp.c_str(), color, force);
   if (!changes.label && !changes.glyphs) return;
@@ -387,6 +407,7 @@ void drawUpdateStatus(bool force = false) {
 void drawFooter(bool force = false, bool clear = true) {
   if (nightMode.state != NightMode::Awake) return;
   drawUpdateStatus();
+  if (themeDisplay.active) return;
   String message;
   int baseline = lastSuccess ? 225 : 227;
   if (!lastSuccess) {
@@ -529,9 +550,10 @@ void updateNightMode() {
       tft.fillScreen(BG);
       if (showSetup) drawSetup(true);
       else {
-        drawHeader(false); for (uint8_t i = 0; i < ROWS; ++i) drawRow(i, false);
+        if (themeDisplay.active) { themeDisplay.render(tft); drawUpdateStatus(true); }
+        else { drawHeader(false); for (uint8_t i = 0; i < ROWS; ++i) drawRow(i, false);
         if (!taskCount) { font.setFont(u8g2_font_6x13_t_cyrillic); textAt(15, 90, "На сьогодні все виконано", WHITE); }
-        drawFooter(true, false);
+        drawFooter(true, false); }
       }
       pollSchedule.next = millis(); // Refresh on wake, even after a failed poll.
     }
@@ -571,7 +593,9 @@ bool applySnapshot(const String& payload) {
   }
   String newDate = doc["date"].as<String>();
   bool rotate = rotation != freshSettings.rotation;
-  bool first = !lastSuccess || showSetup || rotate;
+  bool first = !lastSuccess || showSetup || rotate || themeDisplay.active;
+  // Retain the themed frame until the complete legacy snapshot is validated.
+  if (themeDisplay.active) themeDisplay.clear();
   bool configChanged = !settingsEqual(displaySettings, freshSettings) || (hasSettings && !settingsRemote) ||
     !timezoneKnown || utcOffset != freshOffset || timezoneChangeCount != freshChangeCount;
   for (uint8_t i = 0; i < freshChangeCount && !configChanged; ++i)
@@ -621,7 +645,10 @@ bool applySnapshot(const String& payload) {
   return true;
 }
 
-void poll() {
+template<class Operation> int serverRequest(const String& path, Operation operation);
+void rejectDeviceKey();
+
+void pollLegacy() {
   dataError = ""; responseExpected = 0; responseBytes = 0;
   lastHttpMs = lastBodyMs = lastCleanupMs = lastRenderMs = 0;
   ++pollCount; markStage(1);
@@ -631,49 +658,21 @@ void poll() {
   if (showSetup) drawSetup(); else drawFooter();
   int status;
   String payload;
-  uint32_t cleanupStartedMs = 0;
-  {
-    markStage(2);
-    BearSSL::WiFiClientSecure client;
-    markStage(3);
-    BearSSL::X509List ca(TRUST_ANCHOR);
-    client.setTrustAnchors(&ca);
-    client.setSSLVersion(BR_TLS12, BR_TLS12);
-    client.setBufferSizes(16384, 512); // Safe default receive size; no assumed MFLN.
-    client.setSession(&tlsSession);
-    client.setTimeout(15000);
-    HTTPClient http;
-    http.setTimeout(15000); http.useHTTP10(true);
-    String requestUrl = API_URL;
-    if (!settingsRemote) requestUrl += "?initial_brightness=" + String(brightness) + "&initial_rotation=" + String(rotation);
-    if (!http.begin(client, requestUrl)) {
-      failure = "Помилка HTTPS"; refreshFailed = true; pollSchedule.retry(lastSuccess != 0);
-      if (showSetup) drawSetup(); else drawFooter();
-      markStage(0); return;
-    }
-    http.addHeader("Authorization", "Bearer " + token);
-    http.addHeader("Accept-Encoding", "identity");
-    markStage(4);
-    uint32_t requestStartedMs = millis();
-    if (firstRequestMs == UINT32_MAX) firstRequestMs = requestStartedMs;
-    status = http.GET();
-    lastHttpMs = millis() - requestStartedMs;
-    markStage(5);
-    lastHttpStatus = status;
-    lastTlsError = client.getLastSSLError();
-    responseExpected = http.getSize();
-    if (status == 200 && responseExpected > 0 && responseExpected <= 6144) {
-      uint32_t bodyStartedMs = millis();
-      const char* error = readSnapshotBody(client, payload, responseExpected, 15000,
-        []() { return millis(); }, []() { return WiFi.status() == WL_CONNECTED; }, []() { delay(1); });
-      lastBodyMs = millis() - bodyStartedMs;
-      responseBytes = payload.length();
-      if (error) { dataError = error; payload = ""; }
-    } else if (status == 200) dataError = "empty_or_unbounded_body";
-    cleanupStartedMs = millis();
-    http.end();
-  } // Free TLS buffers before parsing the bounded JSON document.
-  lastCleanupMs = millis() - cleanupStartedMs;
+  String path="/api/device/v1/today";
+  if (!settingsRemote) path += "?initial_brightness=" + String(brightness) + "&initial_rotation=" + String(rotation);
+  uint32_t requestStartedMs=millis();
+  if (firstRequestMs==UINT32_MAX) firstRequestMs=requestStartedMs;
+  status=serverRequest(path,[&](HTTPClient& http,WiFiClient& stream) {
+    responseExpected=http.getSize();
+    if (responseExpected>0 && responseExpected<=6144) {
+      uint32_t bodyStartedMs=millis();
+      const char* error=readSnapshotBody(stream,payload,responseExpected,15000,
+        [](){return millis();},[](){return WiFi.status()==WL_CONNECTED;},[](){delay(1);});
+      lastBodyMs=millis()-bodyStartedMs;responseBytes=payload.length();
+      if (error) { dataError=error;payload=""; }
+    } else dataError="empty_or_unbounded_body";
+  });
+  lastHttpMs=millis()-requestStartedMs;
   bool applied = false;
   if (status == 200 && payload.length()) {
     uint32_t renderStartedMs = millis();
@@ -685,10 +684,7 @@ void poll() {
   }
   refreshFailed = true;
   if (status == 401 || status == 403) {
-    token = ""; configured = false; taskCount = 0; lastSuccess = 0; settingsRemote = false;
-    for (auto& task : tasks) task = Task();
-    failure = "Ключ відкликано або недійсний";
-    saveConfig(); showSetup = true; drawSetup(); markStage(0); return;
+    rejectDeviceKey();markStage(0);return;
   }
   else if (status == 404) {
     failure = "API ще не встановлено";
@@ -699,17 +695,245 @@ void poll() {
   markStage(0);
 }
 
+template<class Operation>
+int serverRequest(const String& path, Operation operation) {
+  String origin=apiOrigin.length()?apiOrigin:String(DEFAULT_ORIGIN);
+  HTTPClient http;
+  http.setTimeout(15000);http.useHTTP10(true);http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  auto request=[&](WiFiClient& client) {
+    client.setTimeout(15000);
+    if (!http.begin(client,origin+path)) return -1;
+    http.addHeader("Authorization","Bearer "+token);
+    http.addHeader("Accept-Encoding","identity");
+    int status=http.GET();lastHttpStatus=status;
+    if (status==200) {
+      // ESP8266HTTPClient clones the supplied client. Plain HTTP connects the
+      // clone, so reading the original WiFiClient dereferences a null context.
+      WiFiClient* stream=http.getStreamPtr();
+      if (stream) operation(http,*stream);
+      else dataError="response_stream";
+    }
+    http.end();return status;
+  };
+  if (origin.startsWith("http://")) { WiFiClient client;return request(client); }
+  BearSSL::WiFiClientSecure client;
+  BearSSL::X509List ca(TRUST_ANCHOR);client.setTrustAnchors(&ca);
+  client.setSSLVersion(BR_TLS12,BR_TLS12);client.setBufferSizes(16384,512);client.setSession(&tlsSession);
+  int result=request(client);lastTlsError=client.getLastSSLError();return result;
+}
+
+bool validFrameId(const String& id) {
+  if (id.length()!=64) return false;
+  for (unsigned i=0;i<64;++i) if (!((id[i]>='0' && id[i]<='9') || (id[i]>='a' && id[i]<='f'))) return false;
+  return true;
+}
+
+bool downloadFrame(const String& id, const String& theme, unsigned expected, ThemeHeader& header) {
+  bool complete=false;
+  FSInfo info;
+  if (!LittleFS.info(info) || info.totalBytes-info.usedBytes<expected+8192) { frameError="frame_disk_full";return false; }
+  int status=serverRequest("/api/device/v2/frames/"+id,[&](HTTPClient& http,WiFiClient& client) {
+    if (http.getSize()!=int(expected)) { frameError="frame_length";return; }
+    File file=LittleFS.open("/theme.pending","w");
+    if (!file) { frameError="frame_file";return; }
+    br_sha256_context hash;br_sha256_init(&hash);
+    uint8_t chunk[256];unsigned received=0;uint32_t started=millis();
+    while (received<expected && millis()-started<30000) {
+      unsigned amount=min(unsigned(sizeof(chunk)),expected-received);
+      int n=client.read(chunk,amount);
+      if (n>0) {
+        if (file.write(chunk,n)!=size_t(n)) { frameError="frame_write";break; }
+        br_sha256_update(&hash,chunk,n);received+=n;yield();
+      } else if (n<0 || WiFi.status()!=WL_CONNECTED) break;
+      else delay(1);
+    }
+    file.close();
+    if (received!=expected) { if (!frameError.length()) frameError="frame_incomplete";return; }
+    uint8_t digest[32];br_sha256_out(&hash,digest);char hex[65];
+    for (unsigned i=0;i<32;++i) snprintf(hex+i*2,3,"%02x",digest[i]);
+    if (id!=hex) { frameError="frame_sha256";return; }
+    complete=true;
+  });
+  if (!complete) { if (!frameError.length()) frameError="frame_http_"+String(status);LittleFS.remove("/theme.pending");return false; }
+  // HTTP/TLS buffers have been freed before validation and rendering.
+  File file=LittleFS.open("/theme.pending","r");
+  const char* error=validateThemePacket(file,expected,header,[](){yield();});
+  std::unique_ptr<uint8_t[]> preparedGlyphs;
+  if (!error) {
+    preparedGlyphs.reset(new(std::nothrow) uint8_t[header.atlasBytes]);
+    if (!preparedGlyphs) error="frame_memory";
+    else if (!file.seek(40) || file.read(preparedGlyphs.get(),header.atlasBytes)!=int(header.atlasBytes)) error="frame_atlas_read";
+  }
+  file.close();
+  if (error) { frameError=error;LittleFS.remove("/theme.pending");return false; }
+  if (!LittleFS.rename("/theme.pending","/theme.frame")) { frameError="frame_commit";LittleFS.remove("/theme.pending");return false; }
+  // No fallible file read occurs after replacing the previous accepted file.
+  themeDisplay.activate(header,id,theme,preparedGlyphs.get());
+  ++frameDownloads;return true;
+}
+
+void rejectDeviceKey() {
+  themeDisplay.clear();token="";configured=false;lastSuccess=0;taskCount=0;settingsRemote=false;
+  for (auto& task:tasks) task=Task();
+  failure="Ключ відкликано або недійсний";saveConfig();showSetup=true;drawSetup(true);
+}
+
+void poll() {
+  if (legacyApi && static_cast<int32_t>(millis()-nextV2Probe)<0) { pollLegacy();return; }
+  ++pollCount;markStage(1);dataError="";frameError="";responseBytes=0;
+  lastHttpMs=lastBodyMs=lastCleanupMs=lastRenderMs=0;
+  if (WiFi.status()!=WL_CONNECTED || time(nullptr)<1760000000) {
+    failure=WiFi.status()!=WL_CONNECTED?"Немає Wi-Fi":"Очікування часу";
+    refreshFailed=true;drawFooter();markStage(0);return;
+  }
+  String path="/api/device/v2/display";
+  if (!settingsRemote) path+="?initial_brightness="+String(brightness)+"&initial_rotation="+String(rotation);
+  String payload;uint32_t started=millis();
+  if (firstRequestMs==UINT32_MAX) firstRequestMs=started;
+  int status=serverRequest(path,[&](HTTPClient& http,WiFiClient& client) {
+    responseExpected=http.getSize();
+    if (responseExpected<=0 || responseExpected>4096) { dataError="manifest_length";return; }
+    const char* error=readSnapshotBody(client,payload,responseExpected,15000,[](){return millis();},
+      [](){return WiFi.status()==WL_CONNECTED;},[](){delay(1);});
+    responseBytes=payload.length();if (error) { dataError=error;payload=""; }
+  });
+  lastHttpMs=millis()-started;
+  if (status==404) {
+    legacyApi=true;nextV2Probe=millis()+300000;--pollCount;pollLegacy();return;
+  }
+  legacyApi=false;
+  bool applied=false;
+  if (status==200 && payload.length()) {
+    DynamicJsonDocument doc(4096);
+    if (deserializeJson(doc,payload)) dataError="manifest_json";
+    else {
+      String id=doc["frame"]["id"]|"", theme=doc["theme"]|"";
+      unsigned bytes=doc["frame"]["bytes"]|0U;
+      DisplaySettings fresh=displaySettings;
+      OffsetTransition changes[4];uint8_t changeCount=0;
+      int offset=doc["utc_offset_seconds"]|100000;
+      int visible=doc["visible_count"]|-1,total=doc["total"]|-1;
+      String frameDate=doc["date"]|"";
+      bool validDate=frameDate.length()==10 && frameDate[4]=='-' && frameDate[7]=='-';
+      for (unsigned i=0;i<frameDate.length() && validDate;++i)
+        if (i!=4 && i!=7 && !isdigit(frameDate[i])) validDate=false;
+      if (doc["schema_version"]!=2 || !validFrameId(id) || theme.length()>32 || !theme.length() ||
+          !validDate || !doc["frame"]["bytes"].is<unsigned>() ||
+          !doc["utc_offset_seconds"].is<int>() || !doc["visible_count"].is<int>() || !doc["total"].is<int>() ||
+          bytes<40 || bytes>THEME_MAX_BYTES || visible<0 || visible>6 || total<visible ||
+          !doc["today_total"].is<int>() || !doc["overdue_total"].is<int>() ||
+          doc["today_total"].as<int>()<0 || doc["today_total"].as<int>()>total ||
+          doc["overdue_total"].as<int>()!=total-doc["today_total"].as<int>() ||
+          offset < -86400 || offset > 86400 ||
+          !parseDisplaySettings(doc["display_settings"],fresh) ||
+          !parseTimezoneChanges(doc["timezone_transitions"],changes,changeCount)) dataError="manifest_schema";
+      else {
+        // Release JSON-backed payload before acquiring a second TLS connection.
+        payload="";
+        bool changed=!themeDisplay.active || id!=themeDisplay.id;
+        ThemeHeader header=themeDisplay.header;
+        bool ready=!changed || downloadFrame(id,theme,bytes,header);
+        if (ready) {
+          if (settingsLocal) fresh=displaySettings;
+          bool rotated=fresh.rotation!=rotation;
+          bool configChanged=!settingsEqual(fresh,displaySettings) || !settingsRemote || !timezoneKnown ||
+            offset!=utcOffset || changeCount!=timezoneChangeCount;
+          for (uint8_t i=0;i<changeCount && !configChanged;++i)
+            configChanged=changes[i].at!=timezoneChanges[i].at || changes[i].offset!=timezoneChanges[i].offset;
+          displaySettings=fresh;settingsRemote=true;timezoneKnown=true;utcOffset=offset;timezoneChangeCount=changeCount;
+          for (uint8_t i=0;i<changeCount;++i) timezoneChanges[i]=changes[i];
+          if (configChanged) saveConfig();
+          if (rotated) tft.setRotation(rotation);
+          taskCount=visible;hiddenCount=total-visible;todayTotal=doc["today_total"];overdueTotal=doc["overdue_total"];
+          date=frameDate;
+          bool full=changed || showSetup || rotated;showSetup=false;
+          updateNightMode();setBrightness();
+          uint32_t renderStarted=millis();
+          ready=nightMode.state!=NightMode::Awake || !full || themeDisplay.render(tft);
+          lastRenderMs=millis()-renderStarted;
+          if (ready) {
+            lastSuccess=time(nullptr);refreshFailed=false;failure="";
+            if (nightMode.state==NightMode::Awake) drawUpdateStatus(full);
+            if (firstSuccessMs==UINT32_MAX) firstSuccessMs=millis();
+            applied=true;
+          } else frameError="frame_render";
+        } else if (!frameError.length()) frameError="frame_load";
+      }
+    }
+  }
+  if (applied) pollSchedule.interval=PollSchedule::NORMAL_INTERVAL;
+  else {
+    refreshFailed=true;
+    if (status==401 || status==403 || lastHttpStatus==401 || lastHttpStatus==403) rejectDeviceKey();
+    else { failure="Немає свіжих даних";pollSchedule.retry(lastSuccess!=0);if (showSetup) drawSetup();else drawFooter(); }
+  }
+  markStage(0);
+}
+
 bool authenticated() {
   if (web.authenticateDigest("admin", web.credentialHash("admin", "Napotim Cube", webPassword.c_str()))) return true;
   web.requestAuthentication(DIGEST_AUTH, "Napotim Cube"); return false;
 }
 
-const char SETTINGS_PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="uk"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Напотім · кубик</title><style>body{background:#101014;color:#eee;font:16px system-ui;max-width:520px;margin:40px auto;padding:20px}label{display:block;margin:20px 0}input,select,button{font:inherit;padding:10px;width:100%;box-sizing:border-box;background:#202026;color:#eee;border:1px solid #555;border-radius:8px}input[type=checkbox]{width:auto}button{background:#7046b5}a{color:#bb9cec}</style><h1>Напотім · кубик</h1><p>Оновлення задач раз на хвилину. Налаштування зберігаються після вимкнення живлення.</p><form method="post" action="/config"><label>Ключ із Напотім → Налаштування → Інтеграції<input name="token" type="password" autocomplete="off" maxlength="48" placeholder="Залиште порожнім, щоб зберегти поточний"></label><label>Джерело налаштувань<select name="source"><option value="remote" {{remote}}>Напотім</option><option value="local" {{local}}>Ця плата</option></select></label><p>У режимі «Ця плата» наведені нижче параметри мають перевагу. У режимі «Напотім» вони заміняться під час синхронізації.</p><label>Яскравість: 1–100<input name="brightness" type="number" min="1" max="100" value="{{brightness}}" required></label><label>Поворот: 0–3<input name="rotation" type="number" min="0" max="3" value="{{rotation}}" required></label><label><input name="scheduled" type="checkbox" {{scheduled}}> Яскравість за розкладом</label><label>Денна яскравість<input name="day_brightness" type="number" min="1" max="100" value="{{day_brightness}}" required></label><label>Вечірня яскравість<input name="night_brightness" type="number" min="1" max="100" value="{{night_brightness}}" required></label><label>Початок дня / пробудження<input name="day_start" type="time" value="{{day_start}}" required></label><label>Початок вечора<input name="night_start" type="time" value="{{night_start}}" required></label><label><input name="sleep_enabled" type="checkbox" {{sleep_enabled}}> Нічний сон: повністю вимикати екран</label><label>Початок сну<input name="sleep_start" type="time" value="{{sleep_start}}" required></label><p>Сон працює і з ручною яскравістю. Часовий пояс береться з Напотім. Після нічного ввімкнення показується повідомлення про сон. Якщо після втрати живлення час невідомий, через 15 секунд екран гасне до синхронізації; підключення триває.</p><button>Зберегти</button></form><hr><h2>Wi-Fi</h2><form method="post" action="/wifi"><label>Назва мережі<input name="ssid" required maxlength="32"></label><label>Пароль<input name="password" type="password" autocomplete="off" minlength="8" maxlength="63" required></label><button>Підключити</button></form><p><a href="/update">Оновити прошивку</a></p></html>)HTML";
+bool writeScreenBytes(WiFiClient& client,const uint8_t* data,unsigned length) {
+  unsigned written=0;uint32_t started=millis();
+  while (written<length && millis()-started<10000) {
+    size_t n=client.write(data+written,length-written);
+    if (n) { written+=n;started=millis(); }
+    else if (!client.connected()) return false;
+    yield();
+  }
+  return written==length;
+}
+
+const char SETTINGS_PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="uk"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Напотім · кубик</title><style>body{background:#101014;color:#eee;font:16px system-ui;max-width:520px;margin:40px auto;padding:20px}label{display:block;margin:20px 0}input,select,button{font:inherit;padding:10px;width:100%;box-sizing:border-box;background:#202026;color:#eee;border:1px solid #555;border-radius:8px}input[type=checkbox]{width:auto}button{background:#7046b5}a{color:#bb9cec}</style><h1>Напотім · кубик</h1><p>Сервер: <input form="display-config" name="api_origin" value="{{api_origin}}" aria-label="Сервер Напотім"></p><p>Оновлення задач раз на хвилину. Налаштування зберігаються після вимкнення живлення.</p><form id="display-config" method="post" action="/config"><label>Ключ із Напотім → Налаштування → Інтеграції<input name="token" type="password" autocomplete="off" maxlength="48" placeholder="Залиште порожнім, щоб зберегти поточний"></label><label>Джерело налаштувань<select name="source"><option value="remote" {{remote}}>Напотім</option><option value="local" {{local}}>Ця плата</option></select></label><p>У режимі «Ця плата» наведені нижче параметри мають перевагу. У режимі «Напотім» вони заміняться під час синхронізації.</p><label>Яскравість: 1–100<input name="brightness" type="number" min="1" max="100" value="{{brightness}}" required></label><label>Поворот: 0–3<input name="rotation" type="number" min="0" max="3" value="{{rotation}}" required></label><label><input name="scheduled" type="checkbox" {{scheduled}}> Яскравість за розкладом</label><label>Денна яскравість<input name="day_brightness" type="number" min="1" max="100" value="{{day_brightness}}" required></label><label>Вечірня яскравість<input name="night_brightness" type="number" min="1" max="100" value="{{night_brightness}}" required></label><label>Початок дня / пробудження<input name="day_start" type="time" value="{{day_start}}" required></label><label>Початок вечора<input name="night_start" type="time" value="{{night_start}}" required></label><label><input name="sleep_enabled" type="checkbox" {{sleep_enabled}}> Нічний сон: повністю вимикати екран</label><label>Початок сну<input name="sleep_start" type="time" value="{{sleep_start}}" required></label><p>Сон працює і з ручною яскравістю. Часовий пояс береться з Напотім. Після нічного ввімкнення показується повідомлення про сон. Якщо після втрати живлення час невідомий, через 15 секунд екран гасне до синхронізації; підключення триває.</p><button>Зберегти</button></form><hr><h2>Wi-Fi</h2><form method="post" action="/wifi"><label>Назва мережі<input name="ssid" required maxlength="32"></label><label>Пароль<input name="password" type="password" autocomplete="off" minlength="8" maxlength="63" required></label><button>Підключити</button></form><p><a href="/update">Оновити прошивку</a></p></html>)HTML";
 
 void configureWeb() {
   static bool uploadAllowed = false;
   static bool uploadStarted = false;
-  web.on("/health", HTTP_GET, []() { web.send(200, "application/json", "{\"firmware\":\"napotim-cube\",\"version\":\"1.2.0\"}"); });
+  web.on("/health", HTTP_GET, []() { web.send(200, "application/json", "{\"firmware\":\"napotim-cube\",\"version\":\"2.0.1\"}"); });
+  web.on("/refresh",HTTP_POST,[]() {
+    if (!authenticated()) return;
+    legacyApi=false;
+    pollSchedule.next=millis();web.send(200,"application/json","{\"scheduled\":true}");
+  });
+  web.on("/restore-source",HTTP_POST,[]() {
+    if (!authenticated()) return;
+    File backup=LittleFS.open("/source-backup.json","r");DynamicJsonDocument doc(1536);
+    DisplaySettings restored;
+    if (!backup || deserializeJson(doc,backup) || !doc["token"].is<const char*>() ||
+        !parseDisplaySettings(doc["display_settings"],restored)) {
+      web.send(409,"text/plain","No valid previous server configuration");return;
+    }
+    backup.close();
+    token=doc["token"].as<String>();apiOrigin=doc["api_origin"]|"";
+    displaySettings=restored;settingsLocal=doc["settings_local"]|false;settingsRemote=false;
+    themeDisplay.clear();lastSuccess=0;taskCount=0;showSetup=true;legacyApi=false;
+    configured=token.startsWith("nptd_") && token.length()==48;
+    sourceConfirmationNeeded=false;
+    saveConfig();LittleFS.remove("/source-backup.json");tft.setRotation(rotation);updateNightMode();setBrightness();
+    if (nightMode.state==NightMode::Awake) drawSetup(true);
+    pollSchedule.next=millis();web.send(200,"application/json","{\"restored\":true}");
+  });
+  web.on("/screen.bmp",HTTP_GET,[]() {
+    if (!authenticated()) return;
+    if (!themeDisplay.active || nightMode.state!=NightMode::Awake) { web.send(409,"text/plain","No active themed screen");return; }
+    uint8_t bmp[66]={0};bmp[0]='B';bmp[1]='M';
+    auto u32=[&](int pos,uint32_t value) { for (int i=0;i<4;++i) bmp[pos+i]=(value>>(i*8))&255; };
+    u32(2,66+115200);u32(10,66);u32(14,40);u32(18,240);u32(22,uint32_t(-240));
+    bmp[26]=1;bmp[28]=16;u32(30,3);u32(34,115200);u32(54,0xF800);u32(58,0x07E0);u32(62,0x001F);
+    web.sendHeader("Cache-Control","no-store");web.setContentLength(66+115200);web.send(200,"image/bmp","");
+    WiFiClient output=web.client();
+    bool complete=writeScreenBytes(output,bmp,66);
+    String stamp=themeDisplay.paintedStamp;bool stale=themeDisplay.paintedStale;
+    themeDisplay.rows([&](int y,uint16_t* pixels) {
+      if (y>=themeDisplay.header.y && y<themeDisplay.header.y+themeDisplay.header.glyphHeight)
+        for (unsigned x=0;x<5U*themeDisplay.header.glyphWidth;++x)
+          pixels[themeDisplay.header.x+x]=themeDisplay.statusPixel(stamp,stale,x,y-themeDisplay.header.y);
+      if (complete) complete=writeScreenBytes(output,reinterpret_cast<uint8_t*>(pixels),480);
+    });
+    if (complete) output.flush(5000);
+  });
   web.on("/status", HTTP_GET, []() {
     if (!authenticated()) return;
     DynamicJsonDocument doc(2560);
@@ -719,6 +943,11 @@ void configureWeb() {
     doc["response_expected"]=responseExpected; doc["response_bytes"]=responseBytes; doc["data_error"]=dataError;
     doc["last_success"]=lastSuccess; doc["task_count"]=taskCount;
     doc["hidden_count"]=hiddenCount; doc["update_stale"]=updateStale();
+    doc["display_protocol"]=themeDisplay.active?2:1;doc["theme"]=themeDisplay.active?themeDisplay.theme:String("legacy");
+    doc["frame_id"]=themeDisplay.id;doc["frame_downloads"]=frameDownloads;doc["frame_error"]=frameError;
+    doc["api_origin"]=apiOrigin.length()?apiOrigin:String(DEFAULT_ORIGIN);
+    doc["status_stamp"]=themeDisplay.paintedStamp;doc["status_red"]=themeDisplay.paintedStale;
+    doc["source_confirmation_needed"]=sourceConfirmationNeeded;
     doc["brightness"]=brightness; doc["rotation"]=rotation;
     doc["effective_brightness"]=effectiveBrightness / 100.0;
     doc["settings_remote"]=settingsRemote; doc["settings_local"]=settingsLocal; doc["timezone_known"]=timezoneKnown;
@@ -756,6 +985,9 @@ void configureWeb() {
     page.replace("{{sleep_start}}", scheduleTime(displaySettings.sleepStart));
     page.replace("{{scheduled}}", displaySettings.scheduled ? "checked" : "");
     page.replace("{{sleep_enabled}}", displaySettings.sleepEnabled ? "checked" : "");
+    String origin=apiOrigin.length()?apiOrigin:String(DEFAULT_ORIGIN);
+    origin.replace("&","&amp;");origin.replace("\"","&quot;");origin.replace("<","&lt;");origin.replace(">","&gt;");
+    page.replace("{{api_origin}}",origin);
     page.replace("{{local}}", settingsLocal ? "selected" : ""); page.replace("{{remote}}", settingsLocal ? "" : "selected");
     web.sendHeader("Cache-Control", "no-store"); web.send(200, "text/html; charset=utf-8", page);
   });
@@ -765,6 +997,15 @@ void configureWeb() {
     bool valid = supplied.length() == 48 && supplied.startsWith("nptd_");
     for (uint8_t i = 5; valid && i < supplied.length(); ++i) valid = isalnum(supplied[i]) || supplied[i] == '_' || supplied[i] == '-';
     if (supplied.length() && !valid) { web.send(400, "text/plain; charset=utf-8", "Некоректний ключ пристрою."); return; }
+    String newOrigin=apiOrigin;
+    if (web.hasArg("api_origin")) {
+      newOrigin=web.arg("api_origin");newOrigin.trim();while (newOrigin.endsWith("/")) newOrigin.remove(newOrigin.length()-1);
+      if (!validApiOrigin(newOrigin.c_str())) {
+        web.send(400,"text/plain","Use HTTPS or a private IPv4 development server with a valid port");return;
+      }
+      if (newOrigin==DEFAULT_ORIGIN) newOrigin="";
+      if (!validApiSourceChange(apiOrigin.c_str(),newOrigin.c_str(),token.c_str(),supplied.c_str())) { web.send(400,"text/plain","A new server requires a different device key");return; }
+    }
     DisplaySettings fresh = displaySettings;
     bool fullForm = web.hasArg("source");
     if (fullForm) {
@@ -787,7 +1028,20 @@ void configureWeb() {
       if (web.hasArg("rotation")) fresh.rotation = constrain(web.arg("rotation").toInt(), 0, 3);
       if (web.hasArg("brightness")) { fresh.brightness = constrain(web.arg("brightness").toInt(), 1, 100); fresh.scheduled = false; }
     }
-    if (supplied.length() && supplied != token) settingsRemote = false;
+    if (newOrigin!=apiOrigin && !LittleFS.exists("/source-backup.json")) {
+      DynamicJsonDocument backup(1536);
+      backup["token"]=token;backup["api_origin"]=apiOrigin;backup["settings_local"]=settingsLocal;
+      writeDisplaySettings(backup.createNestedObject("display_settings"),displaySettings);
+      File file=LittleFS.open("/source-backup.json","w");
+      if (!file || !serializeJson(backup,file)) { web.send(500,"text/plain","Could not save previous source");return; }
+      file.close();
+    }
+    if ((supplied.length() && supplied != token) || newOrigin!=apiOrigin) {
+      settingsRemote=false;themeDisplay.clear();lastSuccess=0;taskCount=0;showSetup=true;
+      legacyApi=false;nextV2Probe=0;
+    }
+    apiOrigin=newOrigin;
+    sourceConfirmationNeeded=false;
     if (supplied.length()) token = supplied;
     bool rotate = rotation != fresh.rotation;
     displaySettings = fresh;
@@ -799,7 +1053,8 @@ void configureWeb() {
     if (nightMode.notice()) drawNightNotice();
     else if (nightMode.state == NightMode::Awake) {
       if (showSetup) drawSetup(true);
-      else { tft.fillScreen(BG); drawHeader(false); for (uint8_t i=0;i<ROWS;++i) drawRow(i, false); drawFooter(true, false); }
+      else { tft.fillScreen(BG);if (themeDisplay.active) { themeDisplay.render(tft);drawUpdateStatus(true); }
+        else { drawHeader(false); for (uint8_t i=0;i<ROWS;++i) drawRow(i, false); drawFooter(true, false); } }
     }
     pollSchedule.next = millis() + 1500; pollSchedule.interval = PollSchedule::NORMAL_INTERVAL;
     web.sendHeader("Cache-Control", "no-store");
@@ -895,7 +1150,7 @@ void loop() {
   }
   if (apActive && WiFi.status() == WL_CONNECTED && configured) { WiFi.softAPdisconnect(true); WiFi.mode(WIFI_STA); apActive = false; }
   pollSchedule.observeReadiness(connected && clockReady, millis());
-  if (configured && pollSchedule.due(millis())) { poll(); pollSchedule.scheduleFrom(millis()); }
+  if (configured && !sourceConfirmationNeeded && pollSchedule.due(millis())) { poll(); pollSchedule.scheduleFrom(millis()); }
   updateNightMode();
   uint32_t minute = millis() / 60000;
   if (lastSuccess && minute != lastFooterMinute) { drawFooter(); lastFooterMinute = minute; }
